@@ -1,0 +1,1381 @@
+#!/usr/bin/env python3
+"""
+XfMarket — универсальный менеджер пакетов с GUI на GTK3 (версия 0.1.4)
+Copyright (C) 2025  pokrish
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Поддерживаемые дистрибутивы: Debian/Ubuntu, Arch Linux, openSUSE, Void Linux, Gentoo, Fedora.
+Зависимости: python3-gi, gir1.2-gtk-3.0, python3-distro (опционально).
+"""
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, GdkPixbuf, Gdk, Pango
+import subprocess
+import threading
+import os
+import re
+import shutil
+import time
+import locale
+from typing import List, Dict, Optional, Callable, Any
+
+def detect_distro() -> Optional[str]:
+    try:
+        import distro
+        dist_id = distro.id()
+        if dist_id in ('debian', 'ubuntu', 'linuxmint', 'pop', 'raspbian'):
+            return 'debian'
+        if dist_id == 'arch':
+            return 'arch'
+        if dist_id in ('opensuse', 'suse', 'opensuse-leap', 'opensuse-tumbleweed'):
+            return 'opensuse'
+        if dist_id == 'void':
+            return 'void'
+        if dist_id == 'gentoo':
+            return 'gentoo'
+        if dist_id == 'fedora':
+            return 'fedora'
+    except ImportError:
+        pass
+
+    if os.path.isfile('/etc/debian_version'):
+        return 'debian'
+    if os.path.isfile('/etc/arch-release'):
+        return 'arch'
+    if os.path.isfile('/etc/SuSE-release') or os.path.isfile('/etc/suse-release'):
+        return 'opensuse'
+    if os.path.isfile('/etc/void-release'):
+        return 'void'
+    if os.path.isfile('/etc/gentoo-release'):
+        return 'gentoo'
+    if os.path.isfile('/etc/fedora-release'):
+        return 'fedora'
+
+    try:
+        with open('/etc/os-release') as f:
+            content = f.read().lower()
+            if 'debian' in content or 'ubuntu' in content:
+                return 'debian'
+            if 'arch' in content:
+                return 'arch'
+            if 'opensuse' in content or 'suse' in content:
+                return 'opensuse'
+            if 'void' in content:
+                return 'void'
+            if 'gentoo' in content:
+                return 'gentoo'
+            if 'fedora' in content:
+                return 'fedora'
+    except Exception:
+        pass
+
+    for cmd, dist in [('apt', 'debian'), ('pacman', 'arch'), ('zypper', 'opensuse'),
+                      ('xbps-install', 'void'), ('emerge', 'gentoo'), ('dnf', 'fedora')]:
+        if shutil.which(cmd):
+            return dist
+    return None
+
+def detect_priv_exec() -> str:
+    for cmd in ['pkexec', 'sudo', 'doas']:
+        if shutil.which(cmd):
+            return cmd
+    raise RuntimeError("No privilege escalation tool found (pkexec, sudo, doas)")
+
+PRIV_EXEC = detect_priv_exec()
+
+class CancellableProcess:
+    def __init__(self, cmd: List[str], timeout: int = 600):
+        self.cmd = cmd
+        self.timeout = timeout
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, 'LANG': 'C', 'LC_ALL': 'C'}
+        )
+        self.output_lines: List[str] = []
+        self.cancelled = False
+
+    def communicate(self, cancel_event: Optional[threading.Event] = None,
+                    log_callback: Optional[Callable[[str], None]] = None) -> tuple:
+        start_time = time.time()
+        for line in iter(self.proc.stdout.readline, ''):
+            if cancel_event and cancel_event.is_set():
+                self._terminate()
+                self.cancelled = True
+                break
+            self.output_lines.append(line)
+            if log_callback:
+                log_callback(line.rstrip())
+            if time.time() - start_time > self.timeout:
+                self.proc.kill()
+                raise subprocess.TimeoutExpired(self.cmd, self.timeout)
+        if not self.cancelled:
+            self.proc.wait()
+        return self.proc.returncode, ''.join(self.output_lines)
+
+    def _terminate(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+def run_command_async(cmd: List[str],
+                      cancel_event: Optional[threading.Event] = None,
+                      timeout: int = 600,
+                      log_callback: Optional[Callable[[str], None]] = None,
+                      progress_callback: Optional[Callable[[int, int], None]] = None) -> tuple:
+    proc = CancellableProcess(cmd, timeout)
+    ret, out = proc.communicate(cancel_event, log_callback)
+    if progress_callback and not proc.cancelled:
+        progress_callback(len(proc.output_lines), 0)
+    if proc.cancelled:
+        raise RuntimeError("Operation cancelled by user")
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, cmd, output=out, stderr=out)
+    return ret, out
+
+class PackageBackend:
+    CACHE_TIMEOUT = 600
+    INSTALL_TIMEOUT = 1200
+    UPGRADE_TIMEOUT = 3600
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        raise NotImplementedError
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        raise NotImplementedError
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        raise NotImplementedError
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        raise NotImplementedError
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        raise NotImplementedError
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        raise NotImplementedError
+
+    def check_prerequisites(self) -> None:
+        pass
+
+    def filter_user_installed(self, packages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        return packages
+
+class DebianBackend(PackageBackend):
+    REQUIRED_CMDS = ['apt-cache', 'dpkg-query', 'apt']
+
+    def check_prerequisites(self) -> None:
+        for cmd in self.REQUIRED_CMDS:
+            if not shutil.which(cmd):
+                raise RuntimeError(f"Required command not found: {cmd}")
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['apt-cache', 'search', query])
+        pkgs = []
+        for line in out.splitlines():
+            if ' - ' in line:
+                name, desc = line.split(' - ', 1)
+                pkgs.append({'name': name.strip(), 'version': '', 'description': desc.strip()})
+        return pkgs
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['dpkg-query', '-W', '-f=${Package} ${Version} ${Description}\n'])
+        pkgs = []
+        for line in out.splitlines():
+            parts = line.split(' ', 2)
+            if len(parts) >= 2:
+                pkgs.append({'name': parts[0], 'version': parts[1],
+                             'description': parts[2] if len(parts) > 2 else ''})
+        return pkgs
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'apt', 'install', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'apt', 'remove', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'apt', 'update'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'apt', 'full-upgrade', '-y'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+    def filter_user_installed(self, packages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        try:
+            _, out = run_command_async(['apt-mark', 'showmanual'])
+            manual_names = set(out.splitlines())
+            return [pkg for pkg in packages if pkg['name'] in manual_names]
+        except Exception:
+            return packages
+
+class ArchBackend(PackageBackend):
+    REQUIRED_CMDS = ['pacman']
+
+    def check_prerequisites(self) -> None:
+        if not shutil.which('pacman'):
+            raise RuntimeError("Required command not found: pacman")
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['pacman', '-Ss', query])
+        pkgs = []
+        pattern = re.compile(r'^(\S+)/(\S+)\s+(.*?)\s*$')
+        current_pkg = None
+        for line in out.splitlines():
+            if not line.startswith(' '):
+                match = pattern.match(line)
+                if match:
+                    if current_pkg:
+                        pkgs.append(current_pkg)
+                    current_pkg = {
+                        'name': match.group(2),
+                        'version': match.group(3) if match.group(3) else '',
+                        'description': ''
+                    }
+                else:
+                    current_pkg = None
+            else:
+                if current_pkg is not None:
+                    current_pkg['description'] += line.strip() + ' '
+        if current_pkg:
+            pkgs.append(current_pkg)
+        return pkgs
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['pacman', '-Q'])
+        pkgs = []
+        for line in out.splitlines():
+            parts = line.split(' ')
+            if len(parts) >= 2:
+                pkgs.append({'name': parts[0], 'version': parts[1], 'description': ''})
+        return pkgs
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'pacman', '-S', '--noconfirm', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'pacman', '-R', '--noconfirm', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'pacman', '-Sy'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'pacman', '-Syu', '--noconfirm'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+    def filter_user_installed(self, packages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        try:
+            _, out = run_command_async(['pacman', '-Qqe'])
+            explicit_names = set(out.splitlines())
+            return [pkg for pkg in packages if pkg['name'] in explicit_names]
+        except Exception:
+            return packages
+
+class OpensuseBackend(PackageBackend):
+    REQUIRED_CMDS = ['zypper']
+
+    def check_prerequisites(self) -> None:
+        if not shutil.which('zypper'):
+            raise RuntimeError("Required command not found: zypper")
+
+    def _parse_zypper_table(self, out: str) -> List[Dict[str, str]]:
+        pkgs = []
+        lines = out.splitlines()
+        header_idx = -1
+        for i, line in enumerate(lines):
+            if 'S ' in line and '|' in line and 'Name' in line:
+                header_idx = i
+                break
+        if header_idx == -1:
+            return pkgs
+        header = lines[header_idx]
+        col_positions = [pos for pos, char in enumerate(header) if char == '|']
+        if len(col_positions) < 2:
+            return pkgs
+        for line in lines[header_idx+1:]:
+            if not line.strip():
+                continue
+            if '|' not in line:
+                continue
+            parts = []
+            prev = 0
+            for pos in col_positions[1:]:
+                parts.append(line[prev+1:pos].strip())
+                prev = pos
+            parts.append(line[prev+1:].strip())
+            if len(parts) >= 2:
+                pkgs.append({
+                    'name': parts[1] if len(parts) > 1 else '',
+                    'version': parts[2] if len(parts) > 2 else '',
+                    'description': parts[-1] if len(parts) > 2 else ''
+                })
+        return pkgs
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['zypper', '--no-color', 'search', query])
+        return self._parse_zypper_table(out)
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['zypper', '--no-color', 'search', '-i'])
+        return self._parse_zypper_table(out)
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'zypper', 'install', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'zypper', 'remove', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'zypper', 'refresh'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'zypper', 'update', '-y'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+class VoidBackend(PackageBackend):
+    REQUIRED_CMDS = ['xbps-query', 'xbps-install', 'xbps-remove']
+
+    def check_prerequisites(self) -> None:
+        for cmd in self.REQUIRED_CMDS:
+            if not shutil.which(cmd):
+                raise RuntimeError(f"Required command not found: {cmd}")
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['xbps-query', '-Rs', query])
+        pkgs = []
+        pattern = re.compile(r'^\[\w+\]\s+(\S+)\s+(.*)$')
+        for line in out.splitlines():
+            match = pattern.match(line)
+            if match:
+                full_name = match.group(1)
+                desc = match.group(2)
+                last_dash = full_name.rfind('-')
+                if last_dash != -1 and re.match(r'\d', full_name[last_dash+1:]):
+                    name = full_name[:last_dash]
+                    version = full_name[last_dash+1:]
+                else:
+                    name = full_name
+                    version = ''
+                pkgs.append({'name': name, 'version': version, 'description': desc})
+        return pkgs
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['xbps-query', '-l'])
+        pkgs = []
+        for line in out.splitlines():
+            if line.startswith('ii '):
+                parts = line.split()[1:]
+                if parts:
+                    pkg_str = parts[0]
+                    last_dash = pkg_str.rfind('-')
+                    if last_dash != -1 and re.match(r'\d', pkg_str[last_dash+1:]):
+                        name = pkg_str[:last_dash]
+                        version = pkg_str[last_dash+1:]
+                    else:
+                        name = pkg_str
+                        version = ''
+                    pkgs.append({'name': name, 'version': version, 'description': ''})
+        return pkgs
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'xbps-install', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'xbps-remove', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'xbps-install', '-S'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'xbps-install', '-Su', '-y'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+class GentooBackend(PackageBackend):
+    REQUIRED_CMDS = ['emerge', 'qlist']
+
+    def check_prerequisites(self) -> None:
+        for cmd in self.REQUIRED_CMDS:
+            if not shutil.which(cmd):
+                raise RuntimeError(f"Required command not found: {cmd}")
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['emerge', '--search', query])
+        pkgs = []
+        pattern_name = re.compile(r'^\*\s+(\S+)')
+        pattern_desc = re.compile(r'^\s*Description:\s*(.*)')
+        current_name = ''
+        current_desc = ''
+        for line in out.splitlines():
+            name_match = pattern_name.match(line)
+            if name_match:
+                if current_name:
+                    pkgs.append({'name': current_name, 'version': '', 'description': current_desc})
+                current_name = name_match.group(1)
+                current_desc = ''
+            desc_match = pattern_desc.match(line)
+            if desc_match:
+                current_desc = desc_match.group(1).strip()
+        if current_name:
+            pkgs.append({'name': current_name, 'version': '', 'description': current_desc})
+        return pkgs
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['qlist', '-Iv'])
+        pkgs = []
+        for line in out.splitlines():
+            parts = line.split('/')
+            if len(parts) >= 2:
+                pkg = parts[1]
+                name_version = pkg.rsplit('-', 1)
+                pkgs.append({'name': name_version[0],
+                             'version': name_version[1] if len(name_version) > 1 else '',
+                             'description': ''})
+        return pkgs
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'emerge', '--ask=n', '--pretend', pkg_name])
+        run_command_async([PRIV_EXEC, 'emerge', '--ask=n', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'emerge', '--ask=n', '--depclean', '--pretend', pkg_name])
+        run_command_async([PRIV_EXEC, 'emerge', '--ask=n', '-C', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'emerge', '--sync'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'emerge', '--ask=n', '-uDN', '@world'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+class FedoraBackend(PackageBackend):
+    REQUIRED_CMDS = ['dnf']
+
+    def check_prerequisites(self) -> None:
+        if not shutil.which('dnf'):
+            raise RuntimeError("Required command not found: dnf")
+
+    def search(self, query: str, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['dnf', 'search', query])
+        pkgs = []
+        for line in out.splitlines():
+            if ' : ' in line:
+                name_ver, desc = line.split(' : ', 1)
+                pkgs.append({'name': name_ver.strip(), 'version': '', 'description': desc.strip()})
+        return pkgs
+
+    def list_installed(self, cancel_event: Optional[threading.Event] = None) -> List[Dict[str, str]]:
+        _, out = run_command_async(['dnf', 'list', 'installed'])
+        pkgs = []
+        for line in out.splitlines():
+            if line and not line.startswith('Installed'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    name_arch = parts[0].rsplit('.', 1)
+                    if len(name_arch) == 2 and name_arch[1] in ('x86_64', 'i686', 'noarch', 'aarch64'):
+                        name = name_arch[0]
+                    else:
+                        name = parts[0]
+                    version = parts[1]
+                    pkgs.append({'name': name, 'version': version, 'description': ''})
+        return pkgs
+
+    def install(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'dnf', 'install', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def remove(self, pkg_name: str, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'dnf', 'remove', '-y', pkg_name], cancel_event=cancel_event, timeout=self.INSTALL_TIMEOUT)
+
+    def refresh_cache(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'dnf', 'makecache'], cancel_event=cancel_event, timeout=self.CACHE_TIMEOUT)
+
+    def system_upgrade(self, cancel_event: Optional[threading.Event] = None) -> None:
+        run_command_async([PRIV_EXEC, 'dnf', 'upgrade', '-y'], cancel_event=cancel_event, timeout=self.UPGRADE_TIMEOUT)
+
+class LocaleManager:
+    def __init__(self):
+        self.translations = {}
+        self.current_lang = 'ru'
+        self._detect_language()
+
+    def _detect_language(self):
+        try:
+            lang, _ = locale.getdefaultlocale()
+            if lang and lang.startswith('ru'):
+                self.current_lang = 'ru'
+            else:
+                self.current_lang = 'en'
+        except Exception:
+            self.current_lang = 'en'
+
+        self.translations = {
+            'ru': {
+                "Поиск пакетов...": "Поиск пакетов...",
+                "Обновить кэш": "Обновить кэш",
+                "Обновить список ПО": "Обновить список ПО",
+                "Обновить всё": "Обновить всё",
+                "Отмена": "Отмена",
+                "Готов": "Готов",
+                "Категории": "Категории",
+                "Установленные": "Установленные",
+                "Игры": "Игры",
+                "Офис": "Офис",
+                "Интернет": "Интернет",
+                "Мультимедиа": "Мультимедиа",
+                "Разработка": "Разработка",
+                "Система": "Система",
+                "Графика": "Графика",
+                "Наука": "Наука",
+                "Образование": "Образование",
+                "Утилиты": "Утилиты",
+                "Базы данных": "Базы данных",
+                "Безопасность": "Безопасность",
+                "Пакет": "Пакет",
+                "Версия": "Версия",
+                "Выберите пакет": "Выберите пакет",
+                "Установить": "Установить",
+                "Удалить": "Удалить",
+                "✓ Установлен": "✓ Установлен",
+                "✗ Не установлен": "✗ Не установлен",
+                "Загрузка установленных пакетов...": "Загрузка установленных пакетов...",
+                "Категория: {} (запрос: {})": "Категория: {} (запрос: {})",
+                "Поиск: {}": "Поиск: {}",
+                "Найдено пакетов: {}": "Найдено пакетов: {}",
+                "Загружено установленных пакетов: {} (показано {})": "Загружено установленных пакетов: {} (показано {})",
+                "Показано пакетов: {}": "Показано пакетов: {}",
+                "Установка: {}": "Установка: {}",
+                "Удаление: {}": "Удаление: {}",
+                "Операция успешно завершена.": "Операция успешно завершена.",
+                "Ошибка операции: {}": "Ошибка операции: {}",
+                "Операция отменена.": "Операция отменена.",
+                "Отправлен запрос на отмену...": "Отправлен запрос на отмену...",
+                "Выполнение...": "Выполнение...",
+                "Отменено": "Отменено",
+                "Ошибка": "Ошибка",
+                "Обновление кэша пакетов...": "Обновление кэша пакетов...",
+                "Полное обновление системы...": "Полное обновление системы...",
+                "Список установленных пакетов обновлён.": "Список установленных пакетов обновлён.",
+                "Принудительное обновление списка установленных пакетов...": "Принудительное обновление списка установленных пакетов...",
+                "Заново загрузить список установленных пакетов": "Заново загрузить список установленных пакетов",
+                "XfMarket v0.1.4 запущен. Дистрибутив: {}": "XfMarket v0.1.4 запущен. Дистрибутив: {}",
+                "Не удалось определить дистрибутив": "Не удалось определить дистрибутив",
+                "Ошибка инициализации: {}": "Ошибка инициализации: {}",
+                "Ошибка загрузки: {}": "Ошибка загрузки: {}",
+                "Ошибка обновления списка: {}": "Ошибка обновления списка: {}",
+            },
+            'en': {
+                "Поиск пакетов...": "Search packages...",
+                "Обновить кэш": "Refresh cache",
+                "Обновить список ПО": "Refresh package list",
+                "Обновить всё": "Upgrade all",
+                "Отмена": "Cancel",
+                "Готов": "Ready",
+                "Категории": "Categories",
+                "Установленные": "Installed",
+                "Игры": "Games",
+                "Офис": "Office",
+                "Интернет": "Internet",
+                "Мультимедиа": "Multimedia",
+                "Разработка": "Development",
+                "Система": "System",
+                "Графика": "Graphics",
+                "Наука": "Science",
+                "Образование": "Education",
+                "Утилиты": "Utilities",
+                "Базы данных": "Databases",
+                "Безопасность": "Security",
+                "Пакет": "Package",
+                "Версия": "Version",
+                "Выберите пакет": "Select a package",
+                "Установить": "Install",
+                "Удалить": "Remove",
+                "✓ Установлен": "✓ Installed",
+                "✗ Не установлен": "✗ Not installed",
+                "Загрузка установленных пакетов...": "Loading installed packages...",
+                "Категория: {} (запрос: {})": "Category: {} (query: {})",
+                "Поиск: {}": "Search: {}",
+                "Найдено пакетов: {}": "Found packages: {}",
+                "Загружено установленных пакетов: {} (показано {})": "Installed packages loaded: {} (shown {})",
+                "Показано пакетов: {}": "Packages shown: {}",
+                "Установка: {}": "Installing: {}",
+                "Удаление: {}": "Removing: {}",
+                "Операция успешно завершена.": "Operation completed successfully.",
+                "Ошибка операции: {}": "Operation error: {}",
+                "Операция отменена.": "Operation cancelled.",
+                "Отправлен запрос на отмену...": "Cancel requested...",
+                "Выполнение...": "Working...",
+                "Отменено": "Cancelled",
+                "Ошибка": "Error",
+                "Обновление кэша пакетов...": "Refreshing package cache...",
+                "Полное обновление системы...": "Full system upgrade...",
+                "Список установленных пакетов обновлён.": "Installed package list updated.",
+                "Принудительное обновление списка установленных пакетов...": "Force-refreshing installed package list...",
+                "Заново загрузить список установленных пакетов": "Reload installed package list",
+                "XfMarket v0.1.4 запущен. Дистрибутив: {}": "XfMarket v0.1.4 started. Distribution: {}",
+                "Не удалось определить дистрибутив": "Could not detect distribution",
+                "Ошибка инициализации: {}": "Initialization error: {}",
+                "Ошибка загрузки: {}": "Loading error: {}",
+                "Ошибка обновления списка: {}": "List update error: {}",
+            }
+        }
+
+    def _(self, text: str, *args) -> str:
+        translated = self.translations.get(self.current_lang, {}).get(text, text)
+        if args:
+            translated = translated.format(*args)
+        return translated
+
+i18n = LocaleManager()
+_ = i18n._
+
+class PackageManagerGUI(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="XfMarket (версия 0.1.4)")
+        self.set_default_size(1000, 700)
+        self.set_border_width(10)
+        self.set_icon_name('system-software-install')
+
+        css = """
+            button {
+                padding: 3px 8px;
+                margin: 2px;
+            }
+            .category-label { font-size: 14px; }
+            .status-installed { color: #2e7d32; font-weight: bold; }
+            .status-not-installed { color: #c62828; font-weight: bold; }
+
+            .install-button {
+                background-image: none;
+                background-color: #2e7d32;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+                transition: background-color 0.2s ease, opacity 0.2s ease;
+            }
+            .install-button:hover {
+                background-color: #3b9a3f;
+            }
+            .install-button:disabled {
+                background-color: #a5d6a7;
+                color: #e0e0e0;
+            }
+
+            .remove-button {
+                background-image: none;
+                background-color: #c62828;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+                transition: background-color 0.2s ease, opacity 0.2s ease;
+            }
+            .remove-button:hover {
+                background-color: #d32f2f;
+            }
+            .remove-button:disabled {
+                background-color: #ef9a9a;
+                color: #e0e0e0;
+            }
+
+            treeview { -GtkTreeView-grid-line-pattern: 1 0; }
+            treeview:selected {
+                background-color: #3584e4;
+                color: white;
+            }
+            treeview:hover {
+                background-color: rgba(53, 132, 228, 0.05);
+            }
+
+            box#info-panel {
+                background-color: @theme_base_color;
+                border: 1px solid @borders;
+                border-radius: 6px;
+                padding: 8px;
+            }
+
+            listbox row:selected {
+                background-color: rgba(53, 132, 228, 0.2);
+                font-weight: bold;
+                transition: background-color 0.2s;
+            }
+            listbox row:hover {
+                background-color: rgba(53, 132, 228, 0.1);
+                transition: background-color 0.15s;
+            }
+
+            progressbar trough {
+                min-height: 10px;
+                border-radius: 4px;
+            }
+            progressbar progress {
+                background-color: #3584e4;
+                border-radius: 4px;
+                transition: all 0.2s;
+            }
+
+            #log_view {
+                font-family: monospace;
+                font-size: 10pt;
+            }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.distro = detect_distro()
+        if self.distro is None:
+            self._show_error_and_exit(_("Не удалось определить дистрибутив"))
+            return
+
+        backends = {
+            'debian': DebianBackend,
+            'arch': ArchBackend,
+            'opensuse': OpensuseBackend,
+            'void': VoidBackend,
+            'gentoo': GentooBackend,
+            'fedora': FedoraBackend
+        }
+        backend_cls = backends[self.distro]
+        try:
+            self.backend = backend_cls()
+            self.backend.check_prerequisites()
+        except Exception as e:
+            self._show_error_and_exit(_("Ошибка инициализации: {}").format(e))
+            return
+
+        self.installed_packages: set = set()
+        self.lock = threading.Lock()
+        self.current_thread: Optional[threading.Thread] = None
+        self.cancel_event = threading.Event()
+        self.current_category = None
+        self.last_search_query = ""
+        self.pending_remove_pkg: Optional[str] = None
+        self.last_installed_pkg: Optional[str] = None
+
+        self.category_definitions = [
+            ("Установленные", "system-software-installed", None),
+            ("Игры", "applications-games", "game"),
+            ("Офис", "applications-office", "office"),
+            ("Интернет", "applications-internet", "internet"),
+            ("Мультимедиа", "applications-multimedia", "multimedia"),
+            ("Разработка", "applications-development", "development"),
+            ("Система", "applications-system", "system"),
+            ("Графика", "applications-graphics", "graphics"),
+            ("Наука", "applications-science", "science math"),
+            ("Образование", "applications-education", "education"),
+            ("Утилиты", "applications-utilities", "utility"),
+            ("Базы данных", "applications-databases", "database"),
+            ("Безопасность", "applications-security", "security"),
+        ]
+
+        self._build_ui()
+        self.log_message(_("XfMarket v0.1.4 запущен. Дистрибутив: {}").format(self.distro))
+        self.load_installed()
+        self.category_listbox.select_row(self.category_rows[0])
+
+    def _show_error_and_exit(self, msg: str):
+        dialog = Gtk.MessageDialog(self, 0, Gtk.MessageType.ERROR, Gtk.ButtonsType.CLOSE, msg)
+        dialog.run()
+        dialog.destroy()
+        Gtk.main_quit()
+
+    def _build_ui(self):
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add(main_vbox)
+
+        hbox_top = Gtk.Box(spacing=6)
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text(_("Поиск пакетов..."))
+        self.search_entry.connect("activate", self.on_search)
+        hbox_top.pack_start(self.search_entry, True, True, 0)
+
+        self.btn_refresh_cache = self._create_button(_("Обновить кэш"), "view-refresh", self.on_refresh_cache)
+        hbox_top.pack_start(self.btn_refresh_cache, False, False, 0)
+
+        self.btn_sync = self._create_button(_("Обновить список ПО"), "view-refresh", self.on_sync_installed)
+        self.btn_sync.set_tooltip_text(_("Заново загрузить список установленных пакетов"))
+        hbox_top.pack_start(self.btn_sync, False, False, 0)
+
+        self.btn_upgrade = self._create_button(_("Обновить всё"), "system-software-update", self.on_system_upgrade)
+        hbox_top.pack_start(self.btn_upgrade, False, False, 0)
+
+        self.btn_cancel = self._create_button(_("Отмена"), "process-stop", self.on_cancel)
+        self.btn_cancel.set_sensitive(False)
+        hbox_top.pack_end(self.btn_cancel, False, False, 0)
+
+        main_vbox.pack_start(hbox_top, False, False, 0)
+
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_bar.set_show_text(True)
+        self.progress_bar.set_text(_("Готов"))
+        main_vbox.pack_start(self.progress_bar, False, False, 0)
+
+        paned = Gtk.HPaned()
+        main_vbox.pack_start(paned, True, True, 0)
+
+        left_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left_vbox.set_size_request(180, -1)
+        self.lbl_categories = Gtk.Label(label="<b>{}</b>".format(_("Категории")))
+        self.lbl_categories.set_use_markup(True)
+        self.lbl_categories.set_xalign(0)
+        left_vbox.pack_start(self.lbl_categories, False, False, 0)
+
+        scrolled_categories = Gtk.ScrolledWindow()
+        scrolled_categories.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.category_listbox = Gtk.ListBox()
+        self.category_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.category_listbox.connect("row-selected", self.on_category_selected)
+        scrolled_categories.add(self.category_listbox)
+        left_vbox.pack_start(scrolled_categories, True, True, 0)
+
+        lang_box = Gtk.Box(spacing=6)
+        self.lang_label = Gtk.Label(label="Язык:" if i18n.current_lang == 'ru' else "Language:")
+        self.lang_label.set_xalign(0)
+        lang_box.pack_start(self.lang_label, False, False, 0)
+
+        self.lang_combo = Gtk.ComboBoxText()
+        self.lang_combo.append_text("Русский")
+        self.lang_combo.append_text("English")
+        self.lang_combo.set_active(0 if i18n.current_lang == 'ru' else 1)
+        self.lang_combo.connect("changed", self.on_language_changed)
+        lang_box.pack_start(self.lang_combo, True, True, 0)
+        left_vbox.pack_end(lang_box, False, False, 0)
+
+        paned.pack1(left_vbox, False, False)
+
+        right_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        paned.pack2(right_vbox, True, True)
+
+        hbox_main = Gtk.Box(spacing=6)
+        right_vbox.pack_start(hbox_main, True, True, 0)
+
+        self.store = Gtk.ListStore(str, str, str)
+        self.treeview = Gtk.TreeView(model=self.store)
+        renderer = Gtk.CellRendererText()
+        column = Gtk.TreeViewColumn(_("Пакет"), renderer, text=0)
+        column.set_sort_column_id(0)
+        self.treeview.append_column(column)
+        renderer_ver = Gtk.CellRendererText()
+        renderer_ver.set_alignment(1.0, 0.5)
+        column_ver = Gtk.TreeViewColumn(_("Версия"), renderer_ver, text=1)
+        self.treeview.append_column(column_ver)
+
+        scrolled_list = Gtk.ScrolledWindow()
+        scrolled_list.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled_list.add(self.treeview)
+        hbox_main.pack_start(scrolled_list, True, True, 0)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        info_box.set_name("info-panel")
+        info_box.set_size_request(250, -1)
+        hbox_main.pack_start(info_box, False, False, 0)
+
+        self.package_icon = Gtk.Image.new_from_icon_name("package-x-generic", Gtk.IconSize.DIALOG)
+        self.package_icon.set_pixel_size(64)
+        self.package_icon.set_name("package_icon")
+        info_box.pack_start(self.package_icon, False, False, 0)
+
+        self.label_name = Gtk.Label(label=_("Выберите пакет"))
+        self.label_name.set_xalign(0)
+        info_box.pack_start(self.label_name, False, False, 0)
+
+        self.label_status = Gtk.Label(label="")
+        self.label_status.set_xalign(0)
+        info_box.pack_start(self.label_status, False, False, 0)
+
+        self.label_desc = Gtk.Label(label="")
+        self.label_desc.set_xalign(0)
+        self.label_desc.set_line_wrap(True)
+        self.label_desc.set_selectable(True)
+        desc_scroll = Gtk.ScrolledWindow()
+        desc_scroll.set_min_content_height(80)
+        desc_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        desc_scroll.add(self.label_desc)
+        info_box.pack_start(desc_scroll, True, True, 0)
+
+        hbox_actions = Gtk.Box(spacing=6)
+        self.btn_install = self._create_install_button(_("Установить"), "list-add", self.on_install)
+        hbox_actions.pack_start(self.btn_install, True, True, 0)
+        self.btn_remove = self._create_remove_button(_("Удалить"), "list-remove", self.on_remove)
+        hbox_actions.pack_start(self.btn_remove, True, True, 0)
+        info_box.pack_start(hbox_actions, False, False, 0)
+
+        self.spinner = Gtk.Spinner()
+        info_box.pack_end(self.spinner, False, False, 0)
+
+        self.log_buffer = Gtk.TextBuffer()
+        self.log_view = Gtk.TextView(buffer=self.log_buffer)
+        self.log_view.set_name("log_view")
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_min_content_height(120)
+        log_scroll.add(self.log_view)
+        right_vbox.pack_start(log_scroll, False, False, 0)
+
+        self.treeview.connect("cursor-changed", self.on_selection_changed)
+        self._populate_categories()
+
+    def _populate_categories(self):
+        self.category_rows = []
+        for name_key, icon, query in self.category_definitions:
+            row = Gtk.ListBoxRow()
+            hbox = Gtk.Box(spacing=6)
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            hbox.pack_start(img, False, False, 0)
+            label = Gtk.Label(label=_(name_key))
+            label.set_xalign(0)
+            label.set_name("category-label")
+            hbox.pack_start(label, True, True, 0)
+            row.add(hbox)
+            row.query = query
+            row.name_key = name_key
+            row.label_widget = label
+            self.category_listbox.add(row)
+            self.category_rows.append(row)
+
+    def _create_button(self, label: str, icon_name: str, callback: Callable) -> Gtk.Button:
+        button = Gtk.Button(label=label)
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
+        button.set_image(icon)
+        button.set_always_show_image(True)
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.connect("clicked", callback)
+        return button
+
+    def _create_install_button(self, label: str, icon_name: str, callback: Callable) -> Gtk.Button:
+        button = self._create_button(label, icon_name, callback)
+        ctx = button.get_style_context()
+        ctx.add_class("install-button")
+        return button
+
+    def _create_remove_button(self, label: str, icon_name: str, callback: Callable) -> Gtk.Button:
+        button = self._create_button(label, icon_name, callback)
+        ctx = button.get_style_context()
+        ctx.add_class("remove-button")
+        return button
+
+    def log_message(self, msg: str):
+        end_iter = self.log_buffer.get_end_iter()
+        self.log_buffer.insert(end_iter, msg + "\n")
+        adj = self.log_view.get_parent().get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+
+    def set_progress(self, fraction: float, text: str = None):
+        GLib.idle_add(self._set_progress_idle, fraction, text)
+
+    def _set_progress_idle(self, fraction: float, text: Optional[str]):
+        self.progress_bar.set_fraction(fraction)
+        if text:
+            self.progress_bar.set_text(text)
+        return False
+
+    def run_in_thread(self, target, callback=None, *args, with_cancel=True):
+        if self.current_thread and self.current_thread.is_alive():
+            self.cancel_event.set()
+        self.cancel_event.clear()
+        self.btn_cancel.set_sensitive(True)
+        self.spinner.start()
+        self.set_progress(0.0, _("Выполнение..."))
+
+        def wrapper():
+            try:
+                result = target(*args)
+            except Exception as e:
+                result = e
+            if not self.cancel_event.is_set() and callback:
+                GLib.idle_add(callback, result)
+            else:
+                GLib.idle_add(self.on_cancelled_complete)
+            self.current_thread = None
+
+        self.current_thread = threading.Thread(target=wrapper)
+        self.current_thread.daemon = True
+        self.current_thread.start()
+
+    def on_cancelled_complete(self):
+        self.spinner.stop()
+        self.btn_cancel.set_sensitive(False)
+        self.set_progress(0.0, _("Отменено"))
+        self.log_message(_("Операция отменена."))
+
+    def on_cancel(self, button):
+        self.cancel_event.set()
+        self.log_message(_("Отправлен запрос на отмену..."))
+        self.spinner.stop()
+        self.btn_cancel.set_sensitive(False)
+        self.set_progress(0.0, _("Отмена..."))
+
+    def populate_store(self, packages: List[Dict[str, str]]):
+        self.store.clear()
+        packages.sort(key=lambda x: x.get('name', '').lower())
+        for pkg in packages:
+            self.store.append([pkg.get('name', ''), pkg.get('version', ''), pkg.get('description', '')])
+        self.set_progress(0.0, _("Показано пакетов: {}").format(len(packages)))
+
+    def show_info_dialog(self, message: str):
+        dialog = Gtk.MessageDialog(self, 0, Gtk.MessageType.INFO, Gtk.ButtonsType.OK, message)
+        dialog.run()
+        dialog.destroy()
+
+    def show_error_dialog(self, message: str):
+        dialog = Gtk.MessageDialog(self, 0, Gtk.MessageType.ERROR, Gtk.ButtonsType.CLOSE, message)
+        dialog.run()
+        dialog.destroy()
+
+    def _find_app_icon(self, pkg_name: str, size: int = 64) -> Optional[GdkPixbuf.Pixbuf]:
+        icon_theme = Gtk.IconTheme.get_default()
+        search_names = [pkg_name, pkg_name.lower(), pkg_name.replace('-', '_')]
+        if '.' not in pkg_name:
+            search_names.append(f"org.{pkg_name}.{pkg_name}")
+
+        for name in search_names:
+            icon_info = icon_theme.choose_icon([name], size, 0)
+            if icon_info:
+                try:
+                    pixbuf = icon_info.load_icon()
+                    return pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+                except Exception:
+                    pass
+
+        pixmaps_dir = '/usr/share/pixmaps'
+        if os.path.isdir(pixmaps_dir):
+            for ext in ('.png', '.svg', '.xpm'):
+                path = os.path.join(pixmaps_dir, pkg_name + ext)
+                if os.path.isfile(path):
+                    try:
+                        pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                        return pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+                    except Exception:
+                        pass
+
+        hicolor_base = '/usr/share/icons/hicolor'
+        for subdir in ('48x48', '64x64', '128x128', '256x256'):
+            apps_dir = os.path.join(hicolor_base, subdir, 'apps')
+            if os.path.isdir(apps_dir):
+                for ext in ('.png', '.svg'):
+                    path = os.path.join(apps_dir, pkg_name + ext)
+                    if os.path.isfile(path):
+                        try:
+                            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                            return pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+                        except Exception:
+                            pass
+
+        papirus_base = '/usr/share/icons/Papirus'
+        if os.path.isdir(papirus_base):
+            for subdir in ('48x48', '64x64', '128x128', '256x256'):
+                apps_dir = os.path.join(papirus_base, subdir, 'apps')
+                if os.path.isdir(apps_dir):
+                    for ext in ('.png', '.svg'):
+                        path = os.path.join(apps_dir, pkg_name + ext)
+                        if os.path.isfile(path):
+                            try:
+                                pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                                return pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+                            except Exception:
+                                pass
+        return None
+
+    def update_package_info(self, pkg_name: str, pkg_version: str, pkg_desc: str):
+        self.label_name.set_markup(f"<b>{pkg_name} {pkg_version}</b>")
+        with self.lock:
+            is_installed = pkg_name in self.installed_packages
+        if is_installed:
+            self.label_status.set_markup('<span class="status-installed">{}</span>'.format(_("✓ Установлен")))
+            self.btn_install.set_sensitive(False)
+            self.btn_remove.set_sensitive(True)
+        else:
+            self.label_status.set_markup('<span class="status-not-installed">{}</span>'.format(_("✗ Не установлен")))
+            self.btn_install.set_sensitive(True)
+            self.btn_remove.set_sensitive(False)
+        self.label_desc.set_text(pkg_desc)
+
+        pixbuf = self._find_app_icon(pkg_name, 64)
+        if pixbuf:
+            self.package_icon.set_from_pixbuf(pixbuf)
+        else:
+            self.package_icon.set_from_icon_name("package-x-generic", Gtk.IconSize.DIALOG)
+            self.package_icon.set_pixel_size(64)
+
+    def refresh_current_view(self):
+        if self.current_category is None and not self.last_search_query:
+            self.load_installed()
+        elif self.last_search_query:
+            self.run_in_thread(
+                self.backend.search, self.on_search_complete,
+                self.last_search_query, with_cancel=False
+            )
+        else:
+            self.run_in_thread(
+                self.backend.search, self.on_search_complete,
+                self.current_category, with_cancel=False
+            )
+
+    def refresh_installed_set(self, callback_after=None):
+        def target():
+            return self.backend.list_installed()
+        def on_done(result):
+            self.spinner.stop()
+            self.btn_cancel.set_sensitive(False)
+            self.set_progress(0.0, _("Готов"))
+            if isinstance(result, Exception):
+                self.log_message(_("Ошибка обновления списка: {}").format(result))
+                self.show_error_dialog(str(result))
+            else:
+                with self.lock:
+                    self.installed_packages = {pkg['name'] for pkg in result}
+                self.log_message(_("Список установленных пакетов обновлён."))
+                if callback_after:
+                    callback_after()
+        self.run_in_thread(target, on_done, with_cancel=False)
+
+    def on_sync_installed(self, button):
+        self.log_message(_("Принудительное обновление списка установленных пакетов..."))
+        def after_sync():
+            self.refresh_current_view()
+            selection = self.treeview.get_selection()
+            model, treeiter = selection.get_selected()
+            if treeiter:
+                cur_name = model[treeiter][0]
+                cur_ver = model[treeiter][1]
+                cur_desc = model[treeiter][2]
+                self.update_package_info(cur_name, cur_ver, cur_desc)
+        self.refresh_installed_set(callback_after=after_sync)
+
+    def on_category_selected(self, listbox, row):
+        if row is None:
+            return
+        query = getattr(row, 'query', None)
+        if self.current_category == query:
+            return
+        if self.current_thread and self.current_thread.is_alive():
+            self.cancel_event.set()
+        self.current_category = query
+        self.search_entry.set_text("")
+        if query is None:
+            self.log_message(_("Загрузка установленных пакетов..."))
+            self.run_in_thread(self.backend.list_installed, self.on_installed_loaded_callback, with_cancel=False)
+        else:
+            self.log_message(_("Категория: {} (запрос: {})").format(
+                row.label_widget.get_text(), query))
+            self.run_in_thread(self.backend.search, self.on_search_complete, query, with_cancel=False)
+
+    def on_search(self, widget):
+        query = self.search_entry.get_text().strip()
+        if query == self.last_search_query:
+            return
+        self.last_search_query = query
+        self.category_listbox.unselect_all()
+        self.current_category = None
+        if not query:
+            self.load_installed()
+            self.category_listbox.select_row(self.category_rows[0])
+            return
+        self.log_message(_("Поиск: {}").format(query))
+        self.run_in_thread(self.backend.search, self.on_search_complete, query, with_cancel=False)
+
+    def on_search_complete(self, result):
+        self.spinner.stop()
+        self.btn_cancel.set_sensitive(False)
+        if isinstance(result, Exception):
+            self.log_message(_("Ошибка: {}").format(result))
+            self.show_error_dialog(str(result))
+            self.set_progress(0.0, _("Ошибка"))
+        else:
+            self.populate_store(result)
+            self.log_message(_("Найдено пакетов: {}").format(len(result)))
+
+    def load_installed(self):
+        self.run_in_thread(self.backend.list_installed, self.on_installed_loaded_callback, with_cancel=False)
+
+    def on_installed_loaded_callback(self, result):
+        self.spinner.stop()
+        self.btn_cancel.set_sensitive(False)
+        if isinstance(result, Exception):
+            self.log_message(_("Ошибка загрузки: {}").format(result))
+            self.show_error_dialog(str(result))
+            self.set_progress(0.0, _("Ошибка"))
+        else:
+            with self.lock:
+                self.installed_packages = {pkg['name'] for pkg in result}
+            filtered = self.backend.filter_user_installed(result)
+            self.populate_store(filtered)
+
+            if self.last_installed_pkg:
+                GLib.idle_add(self._select_package_in_store, self.last_installed_pkg)
+                self.last_installed_pkg = None
+
+            self.log_message(_("Загружено установленных пакетов: {} (показано {})").format(len(result), len(filtered)))
+
+    def _select_package_in_store(self, pkg_name):
+        model = self.treeview.get_model()
+        for row in model:
+            if row[0] == pkg_name:
+                selection = self.treeview.get_selection()
+                selection.select_iter(row.iter)
+                path = model.get_path(row.iter)
+                self.treeview.scroll_to_cell(path, None, True, 0.5, 0.5)
+                self.on_selection_changed(self.treeview)
+                break
+        return False
+
+    def on_selection_changed(self, treeview):
+        selection = treeview.get_selection()
+        model, treeiter = selection.get_selected()
+        if treeiter is None:
+            return
+        pkg_name = model[treeiter][0]
+        pkg_version = model[treeiter][1]
+        pkg_desc = model[treeiter][2]
+        self.update_package_info(pkg_name, pkg_version, pkg_desc)
+
+    def on_install(self, button):
+        selection = self.treeview.get_selection()
+        model, treeiter = selection.get_selected()
+        if treeiter is None:
+            return
+        pkg_name = model[treeiter][0]
+        self.last_installed_pkg = pkg_name
+        self.log_message(_("Установка: {}").format(pkg_name))
+        self.run_in_thread(
+            lambda: self.backend.install(pkg_name, cancel_event=self.cancel_event),
+            self.on_action_complete
+        )
+
+    def on_remove(self, button):
+        selection = self.treeview.get_selection()
+        model, treeiter = selection.get_selected()
+        if treeiter is None:
+            return
+        pkg_name = model[treeiter][0]
+        self.log_message(_("Удаление: {}").format(pkg_name))
+        self.pending_remove_pkg = pkg_name
+        self.run_in_thread(
+            lambda: self.backend.remove(pkg_name, cancel_event=self.cancel_event),
+            self.on_action_complete
+        )
+
+    def on_action_complete(self, result):
+        self.spinner.stop()
+        self.btn_cancel.set_sensitive(False)
+        if isinstance(result, Exception):
+            err_msg = str(result)
+            if isinstance(result, subprocess.CalledProcessError) and result.output:
+                err_msg = result.output.strip()
+            self.log_message(_("Ошибка операции: {}").format(err_msg))
+            self.show_error_dialog(_("Ошибка: {}").format(err_msg))
+            self.set_progress(0.0, _("Ошибка"))
+        else:
+            self.log_message(_("Операция успешно завершена."))
+            self.set_progress(1.0, _("Готов"))
+
+            if self.pending_remove_pkg:
+                with self.lock:
+                    self.installed_packages.discard(self.pending_remove_pkg)
+                selection = self.treeview.get_selection()
+                model, treeiter = selection.get_selected()
+                if treeiter:
+                    cur_name = model[treeiter][0]
+                    if cur_name == self.pending_remove_pkg:
+                        cur_ver = model[treeiter][1]
+                        cur_desc = model[treeiter][2]
+                        self.update_package_info(cur_name, cur_ver, cur_desc)
+                self.pending_remove_pkg = None
+
+            if self.last_installed_pkg:
+                self.category_listbox.select_row(self.category_rows[0])
+                self.search_entry.set_text("")
+                self.last_search_query = ""
+                self.current_category = None
+                self.refresh_installed_set(callback_after=None)
+            else:
+                def after_refresh():
+                    self.refresh_current_view()
+                    selection = self.treeview.get_selection()
+                    model, treeiter = selection.get_selected()
+                    if treeiter:
+                        cur_name = model[treeiter][0]
+                        cur_ver = model[treeiter][1]
+                        cur_desc = model[treeiter][2]
+                        self.update_package_info(cur_name, cur_ver, cur_desc)
+                self.refresh_installed_set(callback_after=after_refresh)
+
+    def on_refresh_cache(self, button):
+        self.log_message(_("Обновление кэша пакетов..."))
+        self.run_in_thread(
+            lambda: self.backend.refresh_cache(cancel_event=self.cancel_event),
+            self.on_action_complete
+        )
+
+    def on_system_upgrade(self, button):
+        self.log_message(_("Полное обновление системы..."))
+        self.run_in_thread(
+            lambda: self.backend.system_upgrade(cancel_event=self.cancel_event),
+            self.on_action_complete
+        )
+
+    def on_language_changed(self, combo):
+        new_lang = 'ru' if combo.get_active() == 0 else 'en'
+        if i18n.current_lang == new_lang:
+            return
+        i18n.current_lang = new_lang
+        self.switch_language()
+
+    def switch_language(self):
+        self.set_title("XfMarket (версия 0.1.4)")
+        self.search_entry.set_placeholder_text(_("Поиск пакетов..."))
+        self.btn_refresh_cache.set_label(_("Обновить кэш"))
+        self.btn_sync.set_label(_("Обновить список ПО"))
+        self.btn_sync.set_tooltip_text(_("Заново загрузить список установленных пакетов"))
+        self.btn_upgrade.set_label(_("Обновить всё"))
+        self.btn_cancel.set_label(_("Отмена"))
+        self.progress_bar.set_text(_("Готов"))
+        self.lbl_categories.set_markup("<b>{}</b>".format(_("Категории")))
+
+        for row in self.category_rows:
+            row.label_widget.set_text(_(row.name_key))
+
+        self.treeview.get_column(0).set_title(_("Пакет"))
+        self.treeview.get_column(1).set_title(_("Версия"))
+        self.label_name.set_text(_("Выберите пакет"))
+        self.btn_install.set_label(_("Установить"))
+        self.btn_remove.set_label(_("Удалить"))
+        self.lang_label.set_text("Язык:" if i18n.current_lang == 'ru' else "Language:")
+
+        selection = self.treeview.get_selection()
+        model, treeiter = selection.get_selected()
+        if treeiter:
+            cur_name = model[treeiter][0]
+            cur_ver = model[treeiter][1]
+            cur_desc = model[treeiter][2]
+            self.update_package_info(cur_name, cur_ver, cur_desc)
+        else:
+            self.label_status.set_text("")
+            self.btn_install.set_sensitive(False)
+            self.btn_remove.set_sensitive(False)
+
+if __name__ == "__main__":
+    win = PackageManagerGUI()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
